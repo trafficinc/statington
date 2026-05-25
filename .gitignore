@@ -1,0 +1,12 @@
+.DS_Store
+/vendor/
+/config/statington.local.php
+/server/storage/*.sqlite
+/server/storage/*.sqlite.legacy.*
+/server/storage/*.sqlite-shm
+/server/storage/*.sqlite-wal
+/server/storage/statington-server.pid
+/server/storage/statington-server.log
+/.phpunit.cache/
+/coverage/
+.editorconfig

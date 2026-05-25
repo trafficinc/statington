@@ -1,0 +1,377 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+const STATINGTON_ROOT = __DIR__ . '/..';
+
+$command = $argv[1] ?? 'help';
+$options = parseOptions(array_slice($argv, 2));
+
+match ($command) {
+    'serve' => serve($options),
+    'stop' => stop($options),
+    'clear' => clear(),
+    'config:publish' => publishConfig($options),
+    'status' => status($options),
+    'demo' => demo(),
+    'help', '--help', '-h' => help(),
+    default => unknown($command),
+};
+
+function parseOptions(array $args): array
+{
+    $options = [];
+    foreach ($args as $arg) {
+        if (!str_starts_with($arg, '--')) {
+            continue;
+        }
+
+        $parts = explode('=', substr($arg, 2), 2);
+        $options[$parts[0]] = $parts[1] ?? true;
+    }
+
+    return $options;
+}
+
+function serve(array $options): never
+{
+    $host = (string) ($options['host'] ?? 'localhost');
+    $port = (string) ($options['port'] ?? '8123');
+    $address = $host . ':' . $port;
+    $router = STATINGTON_ROOT . '/server/router.php';
+    $pidFile = pidFile();
+    $background = !empty($options['background']) || !empty($options['bg']);
+
+    ensureStorageDirectory();
+
+    $command = [PHP_BINARY, '-S', $address, $router];
+    $descriptors = $background
+        ? [
+            0 => ['file', '/dev/null', 'r'],
+            1 => ['file', logFile(), 'a'],
+            2 => ['file', logFile(), 'a'],
+        ]
+        : [
+            0 => STDIN,
+            1 => STDOUT,
+            2 => STDERR,
+        ];
+    $process = proc_open($command, $descriptors, $pipes, STATINGTON_ROOT);
+
+    if (!is_resource($process)) {
+        fwrite(STDERR, "Unable to start Statington collector.\n");
+        exit(1);
+    }
+
+    usleep(100000);
+    $status = proc_get_status($process);
+    if (($status['running'] ?? false) !== true) {
+        $code = proc_close($process);
+        fwrite(STDERR, "Statington collector failed to start at http://{$address}\n");
+        exit($code === -1 ? 1 : $code);
+    }
+
+    $pid = (int) ($status['pid'] ?? 0);
+
+    if ($pid > 0) {
+        file_put_contents($pidFile, json_encode([
+            'pid' => $pid,
+            'host' => $host,
+            'port' => $port,
+            'address' => $address,
+            'router' => $router,
+            'background' => $background,
+            'log' => logFile(),
+            'started_at' => date(DATE_ATOM),
+        ], JSON_PRETTY_PRINT));
+    }
+
+    echo "Statington collector running at http://{$address}\n";
+    if ($background) {
+        echo "PID: {$pid}\n";
+        echo "Log: " . logFile() . "\n";
+        echo "Stop with: php bin/statington stop";
+        if ($host !== 'localhost' || $port !== '8123') {
+            echo " --host={$host} --port={$port}";
+        }
+        echo "\n";
+        exit(0);
+    }
+
+    echo "Press Ctrl+C to stop, or run: php bin/statington stop";
+    if ($host !== 'localhost' || $port !== '8123') {
+        echo " --host={$host} --port={$port}";
+    }
+    echo "\n";
+
+    $code = proc_close($process);
+
+    if (is_file($pidFile)) {
+        @unlink($pidFile);
+    }
+
+    exit($code);
+}
+
+function stop(array $options): never
+{
+    $host = (string) ($options['host'] ?? 'localhost');
+    $port = (string) ($options['port'] ?? '8123');
+    $address = $host . ':' . $port;
+    $router = STATINGTON_ROOT . '/server/router.php';
+    $pidFile = pidFile();
+    $pid = null;
+
+    if (is_file($pidFile)) {
+        $state = json_decode((string) file_get_contents($pidFile), true);
+        if (
+            is_array($state)
+            && ($state['address'] ?? null) === $address
+            && isset($state['pid'])
+            && processMatches((int) $state['pid'], $address, $router)
+        ) {
+            $pid = (int) $state['pid'];
+        }
+    }
+
+    if ($pid === null) {
+        $pid = findServerPid($host, $port, $router);
+    }
+
+    if ($pid === null) {
+        echo "Statington collector is not running at http://{$address}\n";
+        if (is_file($pidFile)) {
+            @unlink($pidFile);
+        }
+        exit(1);
+    }
+
+    if (!terminateProcess($pid)) {
+        fwrite(STDERR, "Unable to stop Statington collector process {$pid}\n");
+        exit(1);
+    }
+
+    if (is_file($pidFile)) {
+        @unlink($pidFile);
+    }
+
+    echo "Statington collector stopped at http://{$address}\n";
+    exit(0);
+}
+
+function clear(): never
+{
+    $storage = STATINGTON_ROOT . '/server/storage';
+    $database = $storage . '/statington.sqlite';
+
+    foreach ([$database, $database . '-shm', $database . '-wal'] as $path) {
+        if (is_file($path) && !unlink($path)) {
+            fwrite(STDERR, "Unable to delete {$path}\n");
+            exit(1);
+        }
+    }
+
+    require_once STATINGTON_ROOT . '/server/Database.php';
+
+    new Statington\Server\Database($database);
+
+    echo "Statington storage cleared and schema recreated at {$database}\n";
+    exit(0);
+}
+
+function publishConfig(array $options): never
+{
+    $target = getcwd() . '/config/statington.php';
+    $source = STATINGTON_ROOT . '/config/statington.php';
+
+    if (!is_dir(dirname($target)) && !mkdir(dirname($target), 0775, true)) {
+        fwrite(STDERR, "Unable to create config directory: " . dirname($target) . "\n");
+        exit(1);
+    }
+
+    if (is_file($target) && empty($options['force'])) {
+        fwrite(STDERR, "Config already exists at {$target}. Use --force to overwrite.\n");
+        exit(1);
+    }
+
+    if (!copy($source, $target)) {
+        fwrite(STDERR, "Unable to publish config to {$target}\n");
+        exit(1);
+    }
+
+    echo "Statington config published to {$target}\n";
+    exit(0);
+}
+
+function status(array $options): never
+{
+    $host = (string) ($options['host'] ?? 'localhost');
+    $port = (string) ($options['port'] ?? '8123');
+    $url = "http://{$host}:{$port}/health";
+    $context = stream_context_create([
+        'http' => [
+            'timeout' => 1.0,
+            'ignore_errors' => true,
+        ],
+    ]);
+
+    $response = @file_get_contents($url, false, $context);
+    $healthy = is_string($response) && json_decode($response, true) === ['ok' => true];
+
+    if ($healthy) {
+        echo "Statington collector is reachable at {$url}\n";
+        exit(0);
+    }
+
+    echo "Statington collector is not reachable at {$url}\n";
+    exit(1);
+}
+
+function demo(): never
+{
+    echo "Statington demo instructions:\n\n";
+    echo "Terminal 1:\n";
+    echo "  php bin/statington serve\n\n";
+    echo "Terminal 2:\n";
+    echo "  php -S localhost:8080 demo/public/index.php\n\n";
+    echo "Open demo routes:\n";
+    echo "  http://localhost:8080/users\n";
+    echo "  http://localhost:8080/login-fail\n";
+    echo "  http://localhost:8080/redacted?token=demo-token&api_key=demo-key&safe=visible\n";
+    echo "  http://localhost:8080/slow\n";
+    echo "  http://localhost:8080/error\n\n";
+    echo "Then view the dashboard:\n";
+    echo "  http://localhost:8123\n";
+    exit(0);
+}
+
+function help(): never
+{
+    echo "Statington CLI\n\n";
+    echo "Usage:\n";
+    echo "  php bin/statington serve [--host=localhost] [--port=8123] [--background]\n";
+    echo "  php bin/statington stop [--host=localhost] [--port=8123]\n";
+    echo "  php bin/statington clear\n";
+    echo "  php bin/statington config:publish [--force]\n";
+    echo "  php bin/statington status [--host=localhost] [--port=8123]\n";
+    echo "  php bin/statington demo\n";
+    exit(0);
+}
+
+function unknown(string $command): never
+{
+    fwrite(STDERR, "Unknown command: {$command}\n\n");
+    help();
+}
+
+function ensureStorageDirectory(): void
+{
+    $storage = STATINGTON_ROOT . '/server/storage';
+    if (!is_dir($storage)) {
+        mkdir($storage, 0775, true);
+    }
+}
+
+function pidFile(): string
+{
+    return STATINGTON_ROOT . '/server/storage/statington-server.pid';
+}
+
+function logFile(): string
+{
+    return STATINGTON_ROOT . '/server/storage/statington-server.log';
+}
+
+function processMatches(int $pid, string $address, string $router): bool
+{
+    $command = processCommand($pid);
+
+    return $command !== null
+        && commandMatchesServer($command, substr($address, strrpos($address, ':') + 1), $router);
+}
+
+function processCommand(int $pid): ?string
+{
+    if ($pid <= 0) {
+        return null;
+    }
+
+    $output = [];
+    $code = 1;
+    exec('ps -p ' . escapeshellarg((string) $pid) . ' -o command=', $output, $code);
+
+    if ($code !== 0 || $output === []) {
+        return null;
+    }
+
+    return trim(implode("\n", $output));
+}
+
+function findServerPid(string $host, string $port, string $router): ?int
+{
+    $output = [];
+    $code = 1;
+    exec('ps -eo pid=,command=', $output, $code);
+
+    if ($code !== 0) {
+        return null;
+    }
+
+    foreach ($output as $line) {
+        $line = trim($line);
+        if ($line === '' || !preg_match('/^(\d+)\s+(.*)$/', $line, $matches)) {
+            continue;
+        }
+
+        $pid = (int) $matches[1];
+        $command = $matches[2];
+
+        if (commandMatchesServer($command, $port, $router, $host)) {
+            return $pid;
+        }
+    }
+
+    return null;
+}
+
+function commandMatchesServer(string $command, string $port, string $router, ?string $host = null): bool
+{
+    if (!preg_match('/(?:^|\s)-S\s+(\S+):' . preg_quote($port, '/') . '(?:\s|$)/', $command, $match)) {
+        return false;
+    }
+
+    if ($host !== null && !in_array($match[1], [$host, 'localhost', '127.0.0.1', '0.0.0.0'], true)) {
+        return false;
+    }
+
+    $normalizedCommand = str_replace('\\', '/', $command);
+    $normalizedRouter = str_replace('\\', '/', $router);
+
+    return str_contains($normalizedCommand, $normalizedRouter)
+        || str_contains($normalizedCommand, 'server/router.php');
+}
+
+function terminateProcess(int $pid): bool
+{
+    if (function_exists('posix_kill')) {
+        if (!@posix_kill($pid, 15)) {
+            return false;
+        }
+
+        for ($attempt = 0; $attempt < 10; $attempt++) {
+            usleep(100000);
+            if (!@posix_kill($pid, 0)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    $output = [];
+    $code = 1;
+    exec('kill ' . escapeshellarg((string) $pid), $output, $code);
+
+    return $code === 0;
+}
