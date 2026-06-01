@@ -155,20 +155,23 @@ function db_annotated_named_sql(string $sql, array $colorMap, array $knownNames)
 }
 
 $groups = [];
-$sqlShapes = [];
+$sqlShapeCounts = [];
 foreach ($databaseEvents as $event) {
     $tables = json_decode((string) ($event['tables'] ?? '[]'), true) ?: ['unknown'];
     $table = (string) ($tables[0] ?? 'unknown');
     $operation = (string) ($event['operation'] ?? 'OTHER');
     $groups[$table][$operation] = ($groups[$table][$operation] ?? 0) + 1;
-    $sqlShapes[db_sql_shape((string) ($event['sql'] ?? ''))] = true;
+    $shape = db_sql_shape((string) ($event['sql'] ?? ''));
+    $sqlShapeCounts[$shape] = ($sqlShapeCounts[$shape] ?? 0) + 1;
 }
-$uniqueSqlShapeCount = count($sqlShapes);
+$uniqueSqlShapeCount = count($sqlShapeCounts);
+$duplicateSqlShapeCount = count(array_filter($sqlShapeCounts, static fn (int $count): bool => $count > 1));
+$duplicateQueryCount = array_sum(array_map(static fn (int $count): int => $count > 1 ? $count : 0, $sqlShapeCounts));
 ?>
 <section class="panel">
     <div class="panel-head">
         <h2>Database Impact</h2>
-        <span><?= $mutationCount ?> mutations, <?= $slowCount ?> slow, <?= $errorCount ?> errors, <?= count($databaseEvents) ?> queries, <?= $uniqueSqlShapeCount ?> Unique SQL Shapes, <?= e($formatDuration($totalDuration)) ?> ms</span>
+        <span><?= $mutationCount ?> mutations, <?= $slowCount ?> slow, <?= $errorCount ?> errors, <?= count($databaseEvents) ?> queries, <?= $uniqueSqlShapeCount ?> unique SQL shapes, <?= $duplicateSqlShapeCount ?> duplicate shapes, <?= $duplicateQueryCount ?> duplicate queries, <?= e($formatDuration($totalDuration)) ?> ms</span>
     </div>
     <?php if ($databaseEvents === []): ?>
         <p class="empty">No database impact was recorded for this request.</p>
@@ -192,11 +195,19 @@ $uniqueSqlShapeCount = count($sqlShapes);
             $bindingColors = db_binding_color_map($bindings);
             $isSlow = (int) ($event['is_slow'] ?? 0) === 1;
             $isError = (int) ($event['is_error'] ?? 0) === 1;
+            $sqlShape = db_sql_shape((string) ($event['sql'] ?? ''));
+            $duplicateCount = $sqlShapeCounts[$sqlShape] ?? 1;
+            $isDuplicateSql = $duplicateCount > 1;
         ?>
-            <details class="db-impact-item <?= $isError ? 'db-impact-error' : ($isSlow ? 'db-impact-slow' : '') ?>" data-db-query-text="<?= e(strtolower(json_encode($event, JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR) ?: '')) ?>" <?= (int) ($event['is_mutation'] ?? 0) === 1 || $isError ? 'open' : '' ?>>
+            <details class="db-impact-item <?= $isError ? 'db-impact-error' : ($isSlow ? 'db-impact-slow' : '') ?><?= $isDuplicateSql ? ' db-impact-duplicate' : '' ?>" data-db-query-text="<?= e(strtolower(json_encode($event, JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR) ?: '')) ?>" <?= (int) ($event['is_mutation'] ?? 0) === 1 || $isError ? 'open' : '' ?>>
                 <summary>
                     <span class="db-op db-op-<?= e(strtolower((string) $event['operation'])) ?>"><?= e($event['operation']) ?></span>
                     <strong><?= e($tables[0] ?? 'unknown') ?></strong>
+                    <span>
+                        <?php if ($isDuplicateSql): ?>
+                            <span class="db-duplicate-badge">duplicate x<?= e((string) $duplicateCount) ?></span>
+                        <?php endif; ?>
+                    </span>
                     <span><?= e($event['driver'] ?? '-') ?></span>
                     <span><?= e($event['affected_rows'] ?? '-') ?> rows</span>
                     <span><?= e($formatDuration($event['duration_ms'] ?? null)) ?> ms<?= $isSlow ? ' slow' : '' ?><?= $isError ? ' error' : '' ?></span>
